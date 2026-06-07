@@ -68,15 +68,40 @@ def extract_text(content) -> str:
     return "\n".join(texts).strip()
 
 
+MAX_DISPLAY_LINES = 20
+MAX_DISPLAY_WIDTH = 120
+TRUNCATE_MSG = "\033[90m... (output truncated)\033[0m"
+
+
+def format_output(output: str) -> str:
+    lines = output.splitlines()
+    truncated = False
+    if len(lines) > MAX_DISPLAY_LINES:
+        lines = lines[:MAX_DISPLAY_LINES]
+        truncated = True
+    formatted_lines = []
+    for line in lines:
+        if len(line) > MAX_DISPLAY_WIDTH:
+            formatted_lines.append(line[:MAX_DISPLAY_WIDTH] + "...")
+            truncated = True
+        else:
+            formatted_lines.append(line)
+    result = "\n".join(formatted_lines)
+    if truncated:
+        result += "\n" + TRUNCATE_MSG
+    return result
+
+
 def execute_tool_calls(response_content) -> list[dict]:
     results = []
     for block in response_content:
         if block.type != "tool_use":
             continue
         command = block.input["command"]
-        print(f"\033[33m$ {command}\033[0m")
+        print(f"\033[34m▶ bash \033[0m\033[1m{command}\033[0m")
+        print("\033[90m─" * 40 + "\033[0m")
         output = run_bash(command)
-        print(output[:200])
+        print(format_output(output))
         results.append({
             "type": "tool_result",
             "tool_use_id": block.id,
