@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -14,7 +15,97 @@ load_dotenv()
 
 WORKDIR = Path.cwd()
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-SYSTEM_PROMPT = "你叫小帅，是一个非常专业的AI助手，每次回答问题你都需要给我提供足够的情绪价值。"
+SYSTEM_PROMPT = f"""
+- 你叫小帅，是一个非常专业的AI助手，每次回答问题你都需要给我提供足够的情绪价值。
+- 你是一个在 {WORKDIR} 工作目录中运行的代码智能体。
+- 对于多步骤任务，必须使用 todo 工具制定和维护执行计划。
+- 当计划包含多个步骤时，任何时刻只能有一个步骤标记为 in_progress。
+- 在任务执行过程中，根据实际进展持续更新计划状态。
+- 优先通过工具完成分析、修改、执行和验证工作，而不是仅用文字说明。
+- 保持计划与实际执行过程同步。
+"""
+
+PLAN_REMINDER_INTERVAL = 3
+
+
+@dataclass
+class PlanItem:
+    content: str
+    status: str = "pending"
+    active_form: str = ""
+
+
+@dataclass
+class PlanningState:
+    items: list[PlanItem] = field(default_factory=list)
+    rounds_since_update: int = 0
+
+
+class TodoManager:
+    def __init__(self):
+        self.state = PlanningState()
+
+    def update(self, items: list) -> str:
+        if len(items) > 12:
+            raise ValueError("Keep the session plan short (max 12 items)")
+
+        normalized = []
+        in_progress_count = 0;
+        for index, raw_item in enumerate(items):
+            content = str(raw_item.get("content", "")).strip()
+            status = str(raw_item.get("status", "pending")).lower()
+            active_form = str(raw_item.get("active_form", "")).strip()
+
+            if not content:
+                raise ValueError(f"Item {index}: content required")
+            if status not in {"pending", "in_progress", "completed"}:
+                raise ValueError(f"Item {index}: invalid status {status}")
+            if status == "in_progress":
+                in_progress_count += 1
+
+            normalized.append(PlanItem(
+                content=content,
+                status=status,
+                active_form=active_form
+            ))
+
+        if in_progress_count > 1:
+            raise ValueError("Only one plan item can be in_progress")
+
+        self.state.items = normalized
+        self.state.rounds_since_update = 0;
+        return self.render()
+
+    def note_round_without_update(self) -> None:
+        self.state.rounds_since_update += 1
+
+    def reminder(self) -> str | None:
+        if not self.state.items:
+            return None
+        if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
+            return None
+        return "<reminder>Refresh your current plan before continuing.</reminder>"
+
+    def render(self) -> str:
+        if not self.state.items:
+            return "No session plan yet."
+        lines = []
+        for item in self.state.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[item.status]
+            line = f"{marker} {item.content}"
+            if item.status == "in_progress" and item.active_form:
+                line += f" ({item.active_form})"
+            lines.append(line)
+        completed = sum(1 for item in self.state.items if item.status == "completed")
+        lines.append(f"\n({completed}/{len(self.state.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
 
 MAX_DISPLAY_LINES = 20
 MAX_DISPLAY_WIDTH = 120
@@ -98,6 +189,7 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 TOOLS = [
@@ -173,6 +265,34 @@ TOOLS = [
             "required": ["path", "old_text", "new_text"]
         }
     },
+    {
+        "name": "todo",
+        "description": "Rewrite the current session plan for multi-step work.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label.",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
 ]
 
 
@@ -230,7 +350,6 @@ def normalize_messages(messages: list) -> list:
     return merged
 
 
-
 def format_output(output: str) -> str:
     lines = output.splitlines()
     truncated = False
@@ -278,15 +397,29 @@ def agent_loop(messages: list) -> None:
             return
 
         results = []
+        used_todo = False
         for block in response.content:
             if block.type != "tool_use":
                 continue
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
             print_tool_call(block.name, block.input, output)
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
 
+            if block.name == "todo":
+                used_todo = True
+        if used_todo:
+            TODO.state.rounds_since_update = 0
+        else:
+            TODO.note_round_without_update()
+            reminder = TODO.reminder()
+            if reminder:
+                results.insert(0, {"type": "text", "text": reminder})
+
+        messages.append({"role": "user", "content": results})
 
 if __name__ == "__main__":
     history = []
